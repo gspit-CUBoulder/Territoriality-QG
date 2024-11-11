@@ -1,0 +1,430 @@
+---
+title: 'Exploring Territoriality as a Multivariate Phenotype'
+author: "Gladiana Spitz"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, warning=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+par(mfrow=c(4,4),
+    mar = c(2, 2, 2, 2))
+library(tidyverse)
+library(krsp)
+library(lubridate)
+library(sf)
+library(spatstat)
+library(cartogram)
+library(adehabitatHR)
+library(ggfortify)
+library(ggplot2)
+library(viridis)
+library(lme4)
+library(MCMCglmm)
+library(igraph)
+library(gridExtra)
+library(pedtricks)
+library(pedigree)
+
+select = dplyr::select
+
+knitr::opts_chunk$set(echo = TRUE)
+con <- krsp_connect(host = "krsp.cepb5cjvqban.us-east-2.rds.amazonaws.com",
+                    dbname ="krsp",
+                    username = Sys.getenv("krsp_user"),
+                    password = Sys.getenv("krsp_password")
+)
+con_suppl <- krsp_connect(host = "krsp.cepb5cjvqban.us-east-2.rds.amazonaws.com",
+                          dbname ="krsp_suppl",
+                          username = Sys.getenv("krsp_user"),
+                          password = Sys.getenv("krsp_password")
+)
+# Script written by me to take KRSP locx and y coordinates and convert them to UTMs
+# Newest update only uses sf to avoid retiring packages
+source("locs_to_UTMs.R")
+# script to pull tree cone counts
+source("~/McAdam Lab/cone_count_summaries.R")
+# script to pull densities
+source("~/McAdam Lab/density.R")
+# script to form pedigree
+source("~/McAdam Lab/create_pedigree.R")
+```
+
+# How do we represent territoriality in red squirrels?
+
+Territoriality is traditionally defined as the exclusive use of space to maintain access to a resource. Extensive data collection and early research in squirrels shows that individuals in environments like our population typically defend some amount of space around a larder cache of resources (midden).
+
+## Gathering Phenotype Components
+
+|Component|units|data tables|psuedocode or script file|
+|---------|-----|-----------|----------|
+|Territory Size|$ha$|census, trees, grid_stakes, behaviour|TerritorySize.Rmd|
+| | | | |
+|Probability of vocalization|ratio|trapping, census|RattleProbability.Rmd|
+| | | | |
+|Intrusion_Rate|ratio|trapping, census|IntrusionRate.Rmd|
+| | | | |
+|Number of total cones|count|flastall2, historic_squirrel_ids|CacheSize.Rmd|
+
+# Prep Pedigree
+
+```{r}
+pedstat <- ped_stats(krsp_pedigree)
+plot(pedstat)
+summary(pedstat)
+
+
+ped <- as.data.frame(krsp_pedigree)
+
+ord <- orderPed(ped)
+ped <- ped[order(ord),]
+
+names(ped) <- c("animal","sire","dam")
+
+Ainv <- inverseA(pedigree)$Ainv
+```
+
+
+# Loading in Territorial Phenotypes
+
+```{r}
+load("cache_size.rdata")
+
+cache_sizes <- cache_sizes %>%
+  mutate(animal = squirrel_id) %>%
+  filter(!is.na(Grid),
+         !is.na(Sex),
+         !is.na(std_density),
+         !is.na(std_local.density),
+         !is.na(std_age))
+
+load("IntrusionRate.rdata")
+
+intruders_model <- intruders_model %>%
+  mutate(animal = squirrel_id)
+
+load("RattleProbability.rdata")
+
+rattle_probability_final <- rattle_probability_final %>%
+  filter(!is.na(Grid),
+         !is.na(Sex),
+         !is.na(std_density),
+         !is.na(std_julian),
+         !is.na(std_age)) %>%
+  mutate(animal = squirrel_id)
+
+load("TerritorySize.rdata")
+
+data <- data %>%
+  mutate(squirrel_id = as.factor(squirrel_id),
+         animal = squirrel_id) %>%
+  as.data.frame()
+```
+
+# What underlies variation in territoriality?
+
+I aim to answer this in four parts. First I will use univariate phenotypic models that account for variation between individuals in each of the four territorial traits. Then I will use univariate animal models to account for differences in genetic and phenotypic components of the variation in each of the traits. I will repeat the building process from phenotypic to animal using a multivariate model.
+
+The covariates will be grid, sex, year, spring grid density, local density in the fall. 
+
+The random effects will be squirrel_id and year for phenotypic models. I will add animal and then dam id for animal models. 
+
+Territory size and cache size are log transformed and treated as normally distributed. Rattle probability and intrusion rate are binary and should have a binomial error distribution. I will use parameter expanded priors as suggested by Jarrod Hadfield.
+
+## Univariate Phenotypic Models
+
+Set the prior
+
+```{r}
+PhenoPrior <- list(G=list(G1=list(V = diag(1), nu = 1, 
+                                  alpha.mu = 0, alpha.V = diag(1)*1000),
+                          G2=list(V = diag(1), nu = 1, 
+                                  alpha.mu = 0, alpha.V = diag(1)*1000)),
+                   R=list(V = diag(1) , nu = 1))
+
+PhenoPrior_bi <- list(G=list(G1=list(V = diag(1), nu = 1, 
+                                  alpha.mu = 0, alpha.V = diag(1)*1000),
+                          G2=list(V = diag(1), nu = 1, 
+                                  alpha.mu = 0, alpha.V = diag(1)*1000)),
+                   R=list(V = diag(1) , fix = 1))
+```
+
+### Territory Size
+
+```{r, fig.height=8, fig.width=8}
+TSModel1 <- MCMCglmm(area_ha_log ~ Grid + Sex + std_density,
+                     random = ~squirrel_id + year.f,
+                     prior = PhenoPrior,
+                     family = "gaussian",
+                     data = data,
+                     nitt = 250000, burnin = 50000, thin = 200,  verbose=F)
+
+plot(TSModel1)
+summary(TSModel1)
+
+posterior.mode(TSModel1$VCV)
+TSRepeatability <- TSModel1$VCV[,1] / 
+  (TSModel1$VCV[,1] + TSModel1$VCV[,2] + 
+     TSModel1$VCV[,3])
+hist(TSRepeatability)
+posterior.mode(TSRepeatability)
+```
+
+### Rattle Count
+
+```{r, fig.height=8, fig.width=8}
+RattleModel1 <- MCMCglmm(rattle_binary ~ Grid + Sex + spl(std_density, k=5) + 
+                           spl(std_julian, k=3) + std_age,
+                         random = ~squirrel_id + Year.f,
+                         prior = PhenoPrior_bi,
+                         family = "threshold",
+                         data = rattle_probability_final, 
+                         nitt = 250000, burnin = 50000, thin = 200, verbose=T)
+
+summary(RattleModel1)
+plot(RattleModel1)
+
+posterior.mode(RattleModel1$VCV)
+RattleRepeatability <- RattleModel1$VCV[,1] / 
+  (RattleModel1$VCV[,1] + RattleModel1$VCV[,2] + RattleModel1$VCV[,3])
+hist(RattleRepeatability)
+posterior.mode(RattleRepeatability)
+```
+
+### Intrusion Count
+
+```{r, fig.height=8, fig.width=8}
+IntrusionModel1 <- MCMCglmm(intruded ~ Grid + Sex + spl(std_density, k=5) + 
+                           spl(std_julian, k=5) + std_age + std_local.density,
+                            random = ~squirrel_id + Year.f,
+                            prior = PhenoPrior_bi,
+                            family = "threshold",
+                            data = intruders_model, 
+                            nitt = 250000, burnin = 50000, thin = 200, verbose=F)
+plot(IntrusionModel1)
+posterior.mode(IntrusionModel1$VCV)
+IntrusionRepeatability <- IntrusionModel1$VCV[,1] / 
+  (IntrusionModel1$VCV[,1] + IntrusionModel1$VCV[,2] + IntrusionModel1$VCV[,3])
+hist(IntrusionRepeatability)
+posterior.mode(IntrusionRepeatability)
+summary(IntrusionModel1)
+```
+
+### Cache Size
+
+```{r, fig.height=8, fig.width=8}
+CacheSizeModel1 <- MCMCglmm(cache_size_lastyear ~ Grid + Sex + std_density + 
+                              std_age + I(std_age^2) + std_local.density,
+                            random = ~squirrel_id + Year.f,
+                            prior = PhenoPrior,
+                            family = "gaussian",
+                            data = cache_sizes, 
+                            nitt = 250000, burnin = 50000, thin = 200, verbose=F)
+plot(CacheSizeModel1)
+posterior.mode(CacheSizeModel1$VCV)
+CacheSizeRepeatability <- CacheSizeModel1$VCV[,1] / 
+  (CacheSizeModel1$VCV[,1] + CacheSizeModel1$VCV[,2] + CacheSizeModel1$VCV[,3])
+hist(CacheSizeRepeatability)
+posterior.mode(CacheSizeRepeatability)
+summary(CacheSizeModel1)
+```
+
+## Univariate Animal Models
+
+Set the prior
+
+```{r}
+GenoPrior <- list(G=list(G1=list(V = diag(1), nu = 1, 
+                                 alpha.mu = 0, alpha.V = diag(1)*1000),
+                         G2=list(V = diag(1), nu = 1, 
+                                 alpha.mu = 0, alpha.V = diag(1)*1000),
+                         G3=list(V = diag(1), nu = 1, 
+                                 alpha.mu = 0, alpha.V = diag(1)*1000)),
+                  R=list(V = diag(1) , nu = 1))
+
+GenoPrior_bi <- list(G=list(G1=list(V = diag(1), nu = 1, 
+                                 alpha.mu = 0, alpha.V = diag(1)*1000),
+                         G2=list(V = diag(1), nu = 1, 
+                                 alpha.mu = 0, alpha.V = diag(1)*1000),
+                         G3=list(V = diag(1), nu = 1, 
+                                 alpha.mu = 0, alpha.V = diag(1)*1000)),
+                  R=list(V = diag(1) , fix = 1))
+```
+
+### TS Area
+
+```{r, fig.height=8, fig.width=8}
+
+TSModel2 <- MCMCglmm(area_ha_log ~ Grid + Sex + std_density,
+                     random = ~squirrel_id + year.f + animal,
+                     prior = GenoPrior,
+                     pedigree = Ainv,
+                     family = "gaussian",
+                     data = data,
+                     nitt = 2500000, burnin = 500000, thin = 2000,  verbose=F)
+
+summary(TSModel2)
+plot(TSModel2)
+
+TSRepeatability <- TSModel2$VCV[,1] / 
+  (TSModel2$VCV[,1] + TSModel2$VCV[,2] + 
+     TSModel2$VCV[,3] + TSModel2$VCV[,4])
+hist(TSRepeatability)
+posterior.mode(TSRepeatability)
+
+TSHerit <- TSModel2$VCV[,3] / 
+  (TSModel2$VCV[,1] + TSModel2$VCV[,2] + 
+     TSModel2$VCV[,3] + TSModel2$VCV[,4])
+hist(TSHerit)
+posterior.mode(TSHerit)
+```
+
+### Rattle Count
+
+```{r, fig.height=8, fig.width=8}
+RattleModel2 <- MCMCglmm(rattle_binary ~ Grid + Sex + spl(std_density, k=5) + 
+                           spl(std_julian, k=3) + std_age,
+                         random = ~squirrel_id + Year.f + animal,
+                         prior = GenoPrior_bi,
+                         family = "threshold",
+                         pedigree = Ainv,
+                         data = rattle_probability_final, 
+                         nitt = 250000, burnin = 50000, thin = 200, verbose=T)
+
+plot(RattleModel2)
+summary(RattleModel2)
+
+RattleRepeatability <- RattleModel2$VCV[,1] / 
+  (RattleModel2$VCV[,1] + RattleModel2$VCV[,2] + 
+     RattleModel2$VCV[,3] + RattleModel2$VCV[,4])
+hist(RattleRepeatability)
+posterior.mode(RattleRepeatability)
+
+RattleHerit <- RattleModel2$VCV[,3] / 
+  (RattleModel2$VCV[,1] + RattleModel2$VCV[,2] + 
+     RattleModel2$VCV[,3] + RattleModel2$VCV[,4])
+hist(RattleHerit)
+posterior.mode(RattleHerit)
+```
+
+### Intrusion Count
+
+```{r, fig.height=8, fig.width=8}
+IntrusionModel2 <- MCMCglmm(intruded ~ Grid + Sex + spl(std_density,k=5) + 
+                           spl(std_julian,k=5) + std_age + std_local.density,
+                            random = ~squirrel_id + Year.f + animal,
+                            prior = GenoPrior_bi,
+                            pedigree = Ainv,
+                            family = "threshold",
+                            data = intruders_model, 
+                            nitt = 250000, burnin = 50000, thin = 200, verbose=F)
+
+plot(IntrusionModel2)
+summary(IntrusionModel2)
+
+IntrusionRepeatability <- IntrusionModel2$VCV[,1] / 
+  (IntrusionModel2$VCV[,1] + IntrusionModel2$VCV[,2] + 
+     IntrusionModel2$VCV[,3] + IntrusionModel2$VCV[,4])
+hist(IntrusionRepeatability)
+posterior.mode(IntrusionRepeatability)
+
+IntrusionHerit <- IntrusionModel2$VCV[,3] / 
+  (IntrusionModel2$VCV[,1] + IntrusionModel2$VCV[,2] + 
+     IntrusionModel2$VCV[,3] + IntrusionModel2$VCV[,4])
+hist(IntrusionHerit)
+posterior.mode(IntrusionHerit)
+```
+
+### Cache Size
+
+```{r, fig.height=8, fig.width=8}
+CacheSizeModel1 <- MCMCglmm(cache_size_lastyear ~ Grid + Sex + std_density + std_age +
+                            I(std_age^2) + std_local_density,
+                            random = ~squirrel_id + Year.f + animal,
+                            prior = GenoPrior,
+                            pedigree = Ainv,
+                            family = "gaussian",
+                            data = cache_sizes, 
+                            nitt = 250000, burnin = 50000, thin = 200, verbose=F)
+
+
+plot(CacheSizeModel2)
+summary(CacheSizeModel2)
+
+CacheSizeRepeatability <- CacheSizeModel2$VCV[,1] / 
+  (CacheSizeModel2$VCV[,1] + CacheSizeModel2$VCV[,2] + 
+     CacheSizeModel2$VCV[,3] + CacheSizeModel2$VCV[,4])
+hist(CacheSizeRepeatability)
+posterior.mode(CacheSizeRepeatability)
+
+CacheSizeHerit <- CacheSizeModel2$VCV[,3] / 
+  (CacheSizeModel2$VCV[,1] + CacheSizeModel2$VCV[,2] + 
+     CacheSizeModel2$VCV[,3] + CacheSizeModel2$VCV[,4])
+hist(CacheSizeHerit)
+posterior.mode(CacheSizeHerit)
+```
+
+## Multivariate Phenotypic Models
+
+Set the prior
+
+```{r, eval=F}
+MultiPhenoPrior <- list(G=list(G1=list(V = diag(4), nu = 4),
+                               G2=list(V = diag(4), nu = 4)),
+                        R=list(V = diag(4) , nu = 4))
+```
+
+We're using relatively informative priors with the same structure as a parameter expanded prior with a diagonal matrix of size 4 to match our number of traits.
+
+```{r, eval=F}
+MultiPhenoModel <- MCMCglmm(cbind(area, rattled, intrusions, cache_size)~
+                              trait - 1 +
+                              trait:Grid + trait:Sex + 
+                              trait:spr_density + trait:log(total_events)+
+                              trait:log(reflo_totals),
+                            random = ~us(trait):squirrel_id +
+                              us(trait):year.f,
+                            
+                            rcov = ~us(trait):units,
+                            family = rep("poisson",4),
+                            prior = MultiPhenoPrior,
+                            data = Territoriality,
+                            nitt = 2000000,
+                            burnin = 1000000,
+                            thin = 1000,
+                            verbose=F)
+```
+
+## Multivariate Genetic Models
+
+Set the prior
+
+```{r, eval=F}
+MultiGenoPrior <- list(G=list(G1=list(V = diag(4), nu = 4),
+                              G2=list(V = diag(4), nu = 4),
+                              G3=list(V = diag(4), nu = 4)),
+                       R=list(V = diag(4) , nu = 4))
+```
+
+We're using relatively informative priors with the same structure as a parameter expanded prior with a diagonal matrix of size 4 to match our number of traits.
+
+```{r, eval=F}
+MultiGenoModel <- MCMCglmm(cbind(area, rattled, intrusions, cache_size)~
+                             trait - 1 +
+                             trait:Grid + 
+                             trait:Sex + 
+                             trait:spr_density + 
+                             trait:log(total_events)+
+                             trait:log(reflo_totals),
+                           random = ~us(trait):squirrel_id + us(trait):animal + 
+                             us(trait):year.f,
+                           pedigree = Ainv,
+                           rcov = ~us(trait):units,
+                           family = rep("poisson",4),
+                           prior = MultiGenoPrior,
+                           data = Territoriality,
+                           nitt = 2000000,
+                           burnin = 1000000,
+                           thin = 1000,
+                           verbose=F)
+```
